@@ -11,6 +11,11 @@ library(ggplot2)
 library(DEoptim)
 library(lubridate)
 library(keras)
+library(reshape2)
+library(rgdal)
+library(NeuralNetTools)
+library(tempdisagg)
+library(zoo)
 
 setwd("~/Plocha/DATA_EXTRAKCE")
 srfp=data.table(readRDS("data_kalibrace.rds"))  #ALADIN
@@ -21,7 +26,7 @@ srfp=srfp[AHEAD==6]
 srfp=srfp[ID==1060]
 srfp=srfp[,c(1:42,44,45,43)]
 srfp=srfp[,c(21:24):=NULL]
-#srfp=srfp[1200:1400,]
+3srfp=srfp[1200:1400,]
 #srfp=na.omit(srfp)
 
 #row_sub = apply(srfp, 1, function(row) all(row !=0 ))
@@ -59,7 +64,7 @@ saveRDS(dates,"qfCOSMO_06_1060")
     ##### AMORE ###########################################################
 
     setwd("~/Plocha/DATA_EXTRAKCE")
- #---Data ALADIN ###################################################################################################
+  #---Data ALADIN ###################################################################################################
     kaldat=readRDS("data_kalibrace.rds")
     kaldat=kaldat[AHEAD==06]
     kaldat=kaldat[ID==1060]
@@ -368,6 +373,50 @@ saveRDS(dates,"qfCOSMO_06_1060")
     res=NN.sim-kaldatqf[,43]
     cat="ALADIN_COSMO_QF_Q"  
     
+##### ALADIN + COSMO + QF = Q #####
+    kaldat=readRDS("COSMO_ALADIN_Q-6h_kalibrace")
+    #kaldat=readRDS("COSMO_ALADIN_Q_kalibrace")
+    kaldat=kaldat[ID==1060]
+    kaldat=kaldat[AHEAD==6]
+    
+    kaldat[,c(21:24)]<-NULL  #odstrani cleny cosmo 17, 18, 19 a 20, kterej sou az v pozdejsich letech
+    kaldat=kaldat[,c(1:38,40,41,42,39)] #uspordani sloupcu
+    sum(is.na(kaldat)) 
+    kaldat=na.omit(kaldat)
+    setwd("~/Plocha/DATA_EXTRAKCE")
+    qf=readRDS("qfCOSMO_06_1060")
+    qf$TIME=as.character(qf$TIME)
+    setkey(kaldat,ORIGIN, AHEAD, ID, TIME)
+    setkey(qf,ORIGIN, AHEAD, ID, TIME)
+    kaldatqf=kaldat[qf]
+    sum(is.na(kaldatqf)) 
+    kaldatqf=na.omit(kaldatqf)
+    tab=kaldatqf[,1:4] #pro verifikacni tabulku
+    kaldatqf=kaldatqf[,c(1:4,42,5:40,43:47,41)] #uspordani sloupcu
+    kaldatqf=kaldatqf[,6:47]    
+    
+    trainset <- kaldatqf[1:1000, ]
+    testset <- kaldatqf[1001:length(kaldat$RAINFALL), ]
+    
+    trainset=as.matrix(trainset)
+    sum(is.na(trainset))  #pocet NA v souboru
+    trainset=na.omit(trainset) #odstraneni radku s NA
+    
+    net.start <- newff(n.neurons = c(41, 5, 3, 1),      
+                       learning.rate.global = 1e-5,        
+                       momentum.global = 0.08,              
+                       error.criterium = 'LMS',           
+                       Stao = NA,
+                       hidden.layer = 'sigmoid',   
+                       output.layer = 'purelin',           
+                       method = 'ADAPTgdwm') 
+    
+    NN.train <- train( net.start, trainset[,c(1:41)], trainset[,42], error.criterium = 'LMS', report = TRUE, show.step = 500, n.shows = 50)
+    NN.sim <- as.vector(sim(NN.train$net, kaldatqf[,c(1:41)]))
+    vertab=data.table(sim=NN.sim, obs=kaldatqf[,42])
+    res=NN.sim-kaldatqf[,42]
+    cat="ALADIN_COSMO_QF/Q-6"  
+    
 ##### Verifikace ####################################################################################################################################  
    
      vertab=data.table(sim=NN.sim, obs=kaldat[,37])
@@ -386,14 +435,47 @@ saveRDS(dates,"qfCOSMO_06_1060")
   tab
     
  # eval=data.table()
-  eval=rbind(eval,tab)
+  eval=rbind(tab, eval)
+
   
-    saveRDS(eval, "evaltab.rds") 
-    eval=readRDS("evaltab.rds")
-  
+### ALADIN-CZ verifikace
+  n=c("ACZ","ACZ+AL","ACZ+AL+CL","ACZ+AL+QF","ACZ+AL+CL+QF")
+  evalb=eval[,cat:=n]
+  vertab=kaldat
+  RMSE= rmse(as.vector(vertab$RAINFALL), as.vector(vertab$'ALADIN-CZ'))
+  vertab$RMSE=RMSE
+  MAE=mae(as.vector(vertab$RAINFALL), as.vector(vertab$'ALADIN-CZ'))
+  ME=mean(vertab$RAINFALL-vertab$'ALADIN-CZ')
+  data.table(RMSE,MAE, ME) 
+  tab=data.table(cat,RMSE,MAE, ME) 
+  tab
     
-      plot(NN.sim, type="l", ylim=c(-1,max(kaldat[,37])), col="red")
-    lines( kaldat[,37],col="blue")
+    saveRDS(eval, "evaltab_correct.rds") 
+    #eval=readRDS("evaltab.rds")
+    eval=readRDS("evaltab_correct.rds")
+    eval=eval[c(1:4),]
+  
+      plotfr=melt(eval,id=1)
+    plotfr$cat<-factor(plotfr$cat, levels=c("ACZ","ACZ+AL","ACZ+AL+CL","ACZ+AL+QF","ACZ+AL+CL+QF"))
+    
+    par(mfrow=c(2,1))
+  B=  ggplot(plotfr, aes(x=cat, y=abs(value), fill=variable)) + 
+      geom_bar(stat="identity")+
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+      xlab("Kombinace předpovědí v horizontu 6 h")+ylab("Suma chyb")+
+      labs(fill="SKÓRE", tag="B")
+      
+    
+   A= ggplot(plotfr, aes(x=cat, y=value, fill=variable)) + 
+      geom_bar(stat="identity", position=position_dodge())+
+      theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))+
+      xlab("Kombinace předpovědí v horizontu 6 h")+ylab("Chybovost")+
+      labs(fill="SKÓRE", tag="A")
+   
+   grid.arrange(A,B, ncol=1, nrow=2)
+        
+        plot(NN.sim, type="l", ylim=c(-1,max(kaldatqf[,42])), col="red")
+    lines( kaldatqf[,42],col="blue")
     lines(res,type="l", col="orange")
 
     
@@ -408,6 +490,8 @@ saveRDS(dates,"qfCOSMO_06_1060")
    
     simtab=simtab[tab]
     saveRDS(simtab, "simtab")
+    
+    
     
       ###### KERAS #########
     
@@ -475,3 +559,89 @@ setkey(Qtab, ID, TIME)
 kaldatQ=Qtab[kaldat]
 kaldatQ=kaldatQ[,c(1:2,4:46,3)]
 saveRDS(kaldatQ, "COSMO_ALADIN_Q_kalibrace")
+
+#### Posunuti casu Q -6h ####
+Qtab=readRDS("prutoky_1h")
+x=as.POSIXct(Qtab$TIME, format ='%Y-%m-%d %H:%M:%S' )
+class(x)
+x=x-21600
+Qtab$TIME=as.character(x)
+saveRDS(Qtab,"prutoky-6h_1h")
+
+Qtab=readRDS("prutoky-6h_1h")
+Qtab$ID=as.factor(Qtab$ID)
+kaldat$TIME=as.character(kaldat$TIME)
+setkey(kaldatQ, ID, TIME)
+setkey(Qtab, ID, TIME)
+kaldatQ=Qtab[kaldatQ]
+kaldatQ=kaldatQ[,c(1:2,4:45,3)]
+kaldatQ[,45]<-NULL
+colnames(kaldatQ)[44]<-"Q-6"
+
+saveRDS(kaldatQ, "COSMO_ALADIN_QF_Q-6h_Q_kalibrace.rds")
+
+
+#### Vyber udalosti ####
+kaldat=readRDS("COSMO_ALADIN_Q_kalibrace")
+kaldat[,43]<-NULL
+kaldat$ORIGIN=as.character(kaldat$ORIGIN)
+kaldat[,2]<-NULL
+kaldat=kaldat[ID==1060]
+event=kaldat[ORIGIN=="2013-05-31 00:00:00"]
+event=kaldat[ORIGIN=="2013-06-01 00:00:00"]
+
+#event=kaldat[ORIGIN %in% c("2013-05-30 00:00:00", "2013-05-30 12:00:00", "2013-05-31 00:00:00", "2013-05-31 12:00:00", "2013-06-01 00:00:00", "2013-06-01 12:00:00")]
+
+#qf=readRDS("qfCOSMO_06_1060")
+#qf$TIME=as.character(qf$TIME)
+#setkey(event, AHEAD, ID, TIME)
+#setkey(qf, AHEAD, ID, TIME)
+#eventqf=qf[event]
+#sum(is.na(kaldatqf)) 
+#kaldatqf=na.omit(kaldatqf)
+
+event=melt(event, id.vars= c("ID","ORIGIN","AHEAD"))
+event=dcast(event, ID + ORIGIN + variable ~ AHEAD)
+
+i=length(event$ID)
+qmeas=event[i,]
+qmeas=qmeas[4:12]
+qplot=melt(qmeas)
+
+event=cbind(event,qmeas)
+event=event[-i,]
+
+### event ALADIN + COSMO = Q ######
+tab=event[,1:3]
+kaldat=event[,4:21]   
+sum(is.na(kaldat)) 
+kaldat=na.omit(kaldat)
+trainset <- kaldat#[1:2000, ]
+testset <- kaldat[36,]
+
+trainset=as.matrix(trainset)
+sum(is.na(trainset))  #pocet NA v souboru
+trainset=na.omit(trainset) #odstraneni radku s NA
+
+net.start <- newff(n.neurons = c(9, 3, 9),      
+                   learning.rate.global = 1e-5,        
+                   momentum.global = 0.08,              
+                   error.criterium = 'LMS',           
+                   Stao = NA,
+                   hidden.layer = 'sigmoid',   
+                   output.layer = 'purelin',           
+                   method = 'ADAPTgdwm') 
+
+NN.train <- train( net.start, trainset[,c(1:9)], trainset[,c(10:18)], error.criterium = 'LMS', report = TRUE, show.step = 500, n.shows = 10)
+NN.sim <-(sim.MLPnet(NN.train$net, kaldat[,c(1:9)]))
+vertab=data.table(sim=NN.sim, obs=kaldat[,c(10:18)])
+res=NN.sim-kaldat[,c(10:18)]
+cat="ALADIN_COSMO"
+
+plot(NN.sim[1,], type="l", ylim=c(-1,max(qmeas)), col="red")
+lines( qplot$value,col="blue")
+lines(res,type="l", col="orange")
+
+
+sum(is.na(NN.sim)) 
+sum(is.na(vertab$obs.RAINFALL)) 
